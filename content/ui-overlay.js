@@ -1357,6 +1357,9 @@
               <button class="tool-btn primary" id="btnModalRefreshSummary" title="Tổng hợp chi tiết nội dung cuộc họp đang chọn">
                 ✨ Cập nhật Tổng hợp
               </button>
+              <button class="tool-btn accent" id="btnModalHealUntranslated" title="Dịch bù ngay tất cả các câu đang bị kẹt ở 'Đang dịch...' trong lịch sử cuộc họp">
+                🔄 Dịch bù câu thiếu
+              </button>
               <button class="tool-btn" id="btnModalNewSession" title="Tạo một bản ghi phiên họp mới trong danh sách lịch sử">
                 ➕ Phiên họp mới
               </button>
@@ -1438,6 +1441,7 @@
           <div class="tab-panel active" id="panel-digest">
             <div style="display:flex; gap:5px; flex-wrap:wrap;">
               <button class="tool-btn primary" id="btnSummarizeMeeting">✨ Tổng hợp chi tiết ngay</button>
+              <button class="tool-btn accent" id="btnHealUntranslated" title="Tự động dịch bù các câu bị kẹt ở Đang dịch...">🔄 Dịch bù câu thiếu</button>
               <button class="tool-btn accent" id="btnExpandFileFromTab">📖 Xem lớn</button>
               <button class="tool-btn" id="btnExportMd">📥 .MD</button>
               <button class="tool-btn" id="btnExportDoc">📄 .DOC</button>
@@ -2860,6 +2864,41 @@
       this.shadow.getElementById("btnModalRefreshSummary").addEventListener("click", () => {
         this.triggerFullSummary();
       });
+
+      const handleManualHeal = async () => {
+        const btn1 = this.shadow.getElementById("btnHealUntranslated");
+        const btn2 = this.shadow.getElementById("btnModalHealUntranslated");
+        if (btn1) {
+          btn1.disabled = true;
+          btn1.textContent = "⏳ Đang dịch bù...";
+        }
+        if (btn2) {
+          btn2.disabled = true;
+          btn2.textContent = "⏳ Đang dịch bù...";
+        }
+        try {
+          const healed = (await this.callbacks.onHealUntranslated?.()) || 0;
+          if (healed > 0) {
+            this.showToast(`✅ Đã dịch bù thành công ${healed} câu thoại trong lịch sử cuộc họp!`);
+          } else {
+            this.showToast("✅ Tất cả các câu thoại trong lịch sử cuộc họp đều đã có bản dịch đầy đủ!");
+          }
+        } catch (err) {
+          this.showToast(`Lỗi khi dịch bù: ${err.message || err}`);
+        } finally {
+          if (btn1) {
+            btn1.disabled = false;
+            btn1.textContent = "🔄 Dịch bù câu thiếu";
+          }
+          if (btn2) {
+            btn2.disabled = false;
+            btn2.textContent = "🔄 Dịch bù câu thiếu";
+          }
+        }
+      };
+
+      this.shadow.getElementById("btnHealUntranslated")?.addEventListener("click", handleManualHeal);
+      this.shadow.getElementById("btnModalHealUntranslated")?.addEventListener("click", handleManualHeal);
 
       const hiddenFileInput = this.shadow.getElementById("hiddenFileInput");
       const triggerFilePicker = () => hiddenFileInput.click();

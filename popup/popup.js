@@ -23,7 +23,63 @@ document.addEventListener("DOMContentLoaded", async () => {
   populateForm(currentSettings);
   renderSessionList();
   bindEvents();
+
+  // Tự động kiểm tra và dịch bù bất kỳ câu thoại nào bị thiếu bản dịch ("Đang dịch...") trong lịch sử cuộc họp
+  autoHealSavedSessions();
 });
+
+async function autoHealSavedSessions() {
+  if (!Array.isArray(savedSessions) || savedSessions.length === 0) return;
+  let totalHealed = 0;
+
+  for (let i = 0; i < savedSessions.length; i++) {
+    const sess = savedSessions[i];
+    if (!sess || !Array.isArray(sess.transcript)) continue;
+
+    let changed = false;
+    for (const item of sess.transcript) {
+      const src = (item.ja || "").trim();
+      const vi = (item.vi || "").trim();
+      if (!src || (vi && vi !== "Đang dịch..." && vi !== "(Đang dịch...)")) {
+        continue;
+      }
+
+      const fastRes = await chrome.runtime.sendMessage({
+        type: "TRANSLATE_FAST",
+        text: src,
+        sourceLang: currentSettings.sourceLang || "auto",
+        targetLang: currentSettings.targetLang || "vi"
+      });
+
+      if (fastRes?.ok && fastRes.result?.translatedText) {
+        item.vi = fastRes.result.translatedText.trim();
+        item.romaji = fastRes.result.romaji || item.romaji || "";
+        item.sourceLang = fastRes.result.sourceLang || item.sourceLang || "ja";
+        item.targetLang = fastRes.result.targetLang || item.targetLang || "vi";
+        changed = true;
+        totalHealed += 1;
+      }
+    }
+
+    if (changed) {
+      const saveRes = await chrome.runtime.sendMessage({
+        type: "SAVE_MEETING_SESSION",
+        session: sess
+      });
+      if (saveRes?.ok && saveRes.session) {
+        savedSessions[i] = saveRes.session;
+        if (selectedSession && selectedSession.sessionId === saveRes.session.sessionId) {
+          openSessionDetail(saveRes.session);
+        }
+      }
+    }
+  }
+
+  if (totalHealed > 0) {
+    renderSessionList();
+    showStatus(`✅ Đã tự động dịch bù ${totalHealed} câu thiếu trong lịch sử cuộc họp!`);
+  }
+}
 
 function populateForm(s) {
   setCaptureModeUI(s.captureMode || "captions");

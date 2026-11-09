@@ -396,7 +396,14 @@
     extractSpeakerBlocks(container) {
       const results = [];
 
-      const textNodes = container.querySelectorAll(CAPTION_TEXT_SELECTORS.join(","));
+      const rawTextNodes = Array.from(
+        container.querySelectorAll(CAPTION_TEXT_SELECTORS.join(","))
+      );
+      // Loại bỏ các thẻ cha bị trùng nếu bên trong đã có thẻ con khớp selector
+      const textNodes = rawTextNodes.filter(
+        (el) => !rawTextNodes.some((other) => other !== el && el.contains(other))
+      );
+
       if (textNodes.length > 0) {
         const groupedByBlockRoot = new Map();
         let lastKnownSpeaker = "";
@@ -532,7 +539,8 @@
           speaker: cleanSpeaker,
           lastRawText: cleanRaw,
           accumulatedText: cleanRaw,
-          committedOffset: 0
+          committedOffset: 0,
+          lastCommittedAnchor: ""
         };
         this.domBlockState.set(element, domState);
         this.handleSpeakerTurnUpdate(element, domState);
@@ -547,74 +555,148 @@
         domState.speaker = cleanSpeaker;
       }
 
-      const prevAccumLen = domState.accumulatedText.length;
-      domState.accumulatedText = this.mergeRollingText(
+      // Kiểm tra xem Google Meet có vừa xóa trắng nội dung cũ của DOM node để viết câu mới hoàn toàn không
+      const isResetByMeet = this.isDomBlockReset(
         domState.accumulatedText,
         domState.lastRawText,
         cleanRaw,
         domState.committedOffset
       );
+
+      if (isResetByMeet) {
+        // Nếu đang có phần câu dở dang chưa chốt ở turn hiện tại thì chốt trước khi reset
+        if (this.currentTurn && this.currentTurn.segments.has(element)) {
+          this.finalizeCurrentTurn("dom_block_reset");
+        }
+        domState.accumulatedText = cleanRaw;
+        domState.lastRawText = cleanRaw;
+        domState.committedOffset = 0;
+        domState.lastCommittedAnchor = "";
+        this.handleSpeakerTurnUpdate(element, domState);
+        return;
+      }
+
+      domState.accumulatedText = this.mergeRollingText(
+        domState.accumulatedText,
+        domState.lastRawText,
+        cleanRaw
+      );
       domState.lastRawText = cleanRaw;
 
+      // Đồng bộ lại committedOffset bằng mỏ neo (lastCommittedAnchor) nếu ASR sửa nhẹ các từ phía trước
+      if (domState.committedOffset > 0 && domState.lastCommittedAnchor) {
+        const anchor = domState.lastCommittedAnchor;
+        const expectedPos = domState.committedOffset - anchor.length;
+        const searchStart = Math.max(0, expectedPos - 25);
+        const searchSlice = domState.accumulatedText.slice(
+          searchStart,
+          Math.min(domState.accumulatedText.length, domState.committedOffset + 25)
+        );
+        const relIdx = searchSlice.indexOf(anchor);
+        if (relIdx >= 0) {
+          domState.committedOffset = searchStart + relIdx + anchor.length;
+          while (
+            domState.committedOffset < domState.accumulatedText.length &&
+            /[\s、，]/.test(domState.accumulatedText[domState.committedOffset])
+          ) {
+            domState.committedOffset++;
+          }
+        }
+      }
+
       if (domState.committedOffset > domState.accumulatedText.length) {
-        domState.committedOffset = Math.max(0, prevAccumLen);
+        domState.committedOffset = 0;
+        domState.lastCommittedAnchor = "";
       }
 
       this.handleSpeakerTurnUpdate(element, domState);
     }
 
     /**
-     * Ghép chuỗi thông minh khi Google Meet cập nhật phụ đề, bảo toàn phần committedOffset ở đầu
+     * Phát hiện khi Google Meet tái sử dụng cùng 1 DOM node cho câu nói mới hoàn toàn
      */
-    mergeRollingText(accumulated, prevRaw, newRaw, committedOffset = 0) {
+    isDomBlockReset(accumulated, prevRaw, newRaw, committedOffset) {
+      if (!prevRaw || !newRaw) return false;
+      if (newRaw.startsWith(prevRaw) || prevRaw.startsWith(newRaw)) return false;
+
+      let commonPrefix = 0;
+      const minLen = Math.min(prevRaw.length, newRaw.length);
+      while (commonPrefix < minLen && prevRaw[commonPrefix] === newRaw[commonPrefix]) {
+        commonPrefix++;
+      }
+      if (commonPrefix >= 4 || commonPrefix >= Math.floor(minLen * 0.45)) {
+        return false;
+      }
+
+      // Kiểm tra xem phần đầu của newRaw có nằm trong prevRaw hoặc accumulated không (trường hợp cuộn dòng)
+      const probeLen = Math.min(8, newRaw.length);
+      if (probeLen >= 4) {
+        const probe = newRaw.slice(0, probeLen);
+        if (prevRaw.includes(probe) || accumulated.includes(probe)) {
+          return false;
+        }
+      }
+
+      // Nếu đã từng chốt câu trên block này (committedOffset > 0) hoặc câu mới ngắn hơn hẳn câu cũ mà không trùng
+      if (committedOffset > 0 || newRaw.length < prevRaw.length * 0.65) {
+        return true;
+      }
+
+      return false;
+    }
+
+    /**
+     * Ghép chuỗi thông minh khi Google Meet cập nhật hoặc cuộn dòng phụ đề
+     */
+    mergeRollingText(accumulated, prevRaw, newRaw) {
       if (!accumulated) return newRaw;
       if (newRaw === prevRaw) return accumulated;
 
-      const lockedPrefix = committedOffset > 0 ? accumulated.slice(0, committedOffset) : "";
       const headPrefixLen = Math.max(0, accumulated.length - prevRaw.length);
       const preservedHead = headPrefixLen > 0 ? accumulated.slice(0, headPrefixLen) : "";
 
-      let candidate = "";
+      // 1. Trường hợp phổ biến nhất: Google Meet nối thêm từ vào cuối prevRaw
       if (newRaw.startsWith(prevRaw)) {
-        candidate = preservedHead + newRaw;
-      } else {
-        let commonPrefix = 0;
-        const minLen = Math.min(prevRaw.length, newRaw.length);
-        while (commonPrefix < minLen && prevRaw[commonPrefix] === newRaw[commonPrefix]) {
-          commonPrefix++;
-        }
+        return preservedHead + newRaw;
+      }
 
-        if (
-          commonPrefix >= Math.floor(prevRaw.length * 0.55) ||
-          prevRaw.length - commonPrefix <= 14
-        ) {
-          candidate = preservedHead + newRaw;
-        } else {
-          const maxOverlap = Math.min(accumulated.length, newRaw.length);
-          let matchedOverlap = 0;
-          for (let len = maxOverlap; len >= 4; len--) {
-            if (accumulated.endsWith(newRaw.slice(0, len))) {
-              matchedOverlap = len;
-              break;
-            }
-          }
-          if (matchedOverlap > 0) {
-            candidate = accumulated + newRaw.slice(matchedOverlap);
-          } else if (prevRaw.length < 15 && headPrefixLen === 0) {
-            candidate = newRaw;
-          } else {
-            candidate = `${accumulated} ${newRaw}`.trim();
-          }
+      // 2. Trường hợp Google Meet cuộn ẩn dòng trên cùng, phần đầu của newRaw nằm ở phần giữa/cuối của accumulated
+      const maxAnchor = Math.min(24, newRaw.length);
+      for (let len = maxAnchor; len >= 6; len--) {
+        const prefixProbe = newRaw.slice(0, len);
+        const matchIdx = accumulated.lastIndexOf(prefixProbe);
+        if (matchIdx >= 0 && accumulated.length - matchIdx <= prevRaw.length + 15) {
+          return accumulated.slice(0, matchIdx) + newRaw;
         }
       }
 
-      // Đảm bảo phần văn bản đã chốt (lockedPrefix) không bị lệch chỉ số committedOffset
-      if (lockedPrefix && !candidate.startsWith(lockedPrefix)) {
-        const tailAfterPrefix = candidate.slice(Math.min(candidate.length, lockedPrefix.length));
-        return lockedPrefix + tailAfterPrefix;
+      // 3. Trường hợp ASR chỉnh sửa phần đuôi của câu đang nói (cùng phần đầu)
+      let commonPrefix = 0;
+      const minLen = Math.min(prevRaw.length, newRaw.length);
+      while (commonPrefix < minLen && prevRaw[commonPrefix] === newRaw[commonPrefix]) {
+        commonPrefix++;
       }
 
-      return candidate;
+      if (
+        commonPrefix >= Math.floor(prevRaw.length * 0.5) ||
+        prevRaw.length - commonPrefix <= 16
+      ) {
+        return preservedHead + newRaw;
+      }
+
+      // 4. Kiểm tra chồng lắp (overlap) giữa đuôi của accumulated và đầu của newRaw
+      const maxOverlap = Math.min(accumulated.length, newRaw.length);
+      for (let len = maxOverlap; len >= 4; len--) {
+        if (accumulated.endsWith(newRaw.slice(0, len))) {
+          return accumulated + newRaw.slice(len);
+        }
+      }
+
+      if (prevRaw.length < 15 && headPrefixLen === 0) {
+        return newRaw;
+      }
+
+      return `${accumulated} ${newRaw}`.trim();
     }
 
     /**
@@ -802,6 +884,9 @@
           } else {
             domState.committedOffset += splitIdx;
           }
+          domState.lastCommittedAnchor = domState.accumulatedText
+            .slice(Math.max(0, domState.committedOffset - 14), domState.committedOffset)
+            .trim();
 
           // Đưa mệnh đề hoàn chỉnh vào currentTurn và chốt thành 1 câu hoàn chỉnh ngay lập tức
           this.ensureCurrentTurn(speaker);
@@ -842,7 +927,7 @@
         });
       };
 
-      if (now - turnRef.lastLiveEmitAt >= 240) {
+      if (now - turnRef.lastLiveEmitAt >= 420) {
         if (turnRef.liveTimer) {
           clearTimeout(turnRef.liveTimer);
           turnRef.liveTimer = null;
@@ -852,7 +937,7 @@
         turnRef.liveTimer = setTimeout(() => {
           turnRef.liveTimer = null;
           emitLive();
-        }, 240 - (now - turnRef.lastLiveEmitAt));
+        }, 420 - (now - turnRef.lastLiveEmitAt));
       }
 
       if (turnRef.checkpointTimer) {
@@ -973,6 +1058,9 @@
         const st = this.domBlockState.get(el);
         if (st) {
           st.committedOffset = st.accumulatedText.length;
+          st.lastCommittedAnchor = st.accumulatedText
+            .slice(Math.max(0, st.committedOffset - 14), st.committedOffset)
+            .trim();
         }
       }
 

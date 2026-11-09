@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "Meet EN-JA-VI IT Infra Translator & History",
-  "version": "2.0.0",
+  "version": "2.0.1",
   "description": "Dịch đa ngôn ngữ Anh - Nhật - Việt realtime trên Google Meet chuyên sâu ngành IT Infra, tự động ngắt câu theo nghĩa và lưu danh sách lịch sử & tổng hợp cuộc họp.",
   "permissions": [
     "storage",
@@ -13,6 +13,9 @@
   "host_permissions": [
     "https://meet.google.com/*",
     "https://translate.googleapis.com/*",
+    "https://translate.google.com/*",
+    "https://clients5.google.com/*",
+    "https://api.mymemory.translated.net/*",
     "https://generativelanguage.googleapis.com/*",
     "https://api.groq.com/*",
     "https://api.openai.com/*"

@@ -22,6 +22,8 @@
   let currentMeetingTitle = "";
   let sessionStartTimeStr = "";
   let saveSessionTimer = null;
+  let healWatchdogTimer = null;
+  let isHealingInProgress = false;
 
   // Quản lý gộp/ngắt câu cho chế độ Thu Audio AI
   let activeAudioTurnId = null;
@@ -233,6 +235,12 @@
       },
       onForceSaveSession: async () => {
         return await persistCurrentSessionNow();
+      },
+      onHealUntranslated: async () => {
+        return await healUntranslatedEntries({
+          includeAllSavedSessions: true,
+          forceAllEmpty: true
+        });
       }
     });
 
@@ -257,6 +265,177 @@
     });
 
     observer.start();
+
+    // Watchdog định kỳ 3.5s: Tự động phát hiện và dịch bù bất kỳ câu nào bị kẹt ở "Đang dịch..." quá 2.5s
+    if (healWatchdogTimer) clearInterval(healWatchdogTimer);
+    healWatchdogTimer = setInterval(() => {
+      healUntranslatedEntries({ includeAllSavedSessions: false, forceAllEmpty: false });
+    }, 3500);
+  }
+
+  function isUntranslatedValue(viText) {
+    const clean = (viText || "").trim();
+    return (
+      !clean ||
+      clean === "Đang dịch..." ||
+      clean === "(Đang dịch...)" ||
+      clean === "Translating..."
+    );
+  }
+
+  /**
+   * Tự động kiểm tra và dịch bù toàn bộ các câu bị kẹt ở trạng thái "Đang dịch..."
+   * trong cả phiên họp đang diễn ra lẫn danh sách lịch sử cuộc họp đã lưu.
+   */
+  async function healUntranslatedEntries({
+    includeAllSavedSessions = false,
+    forceAllEmpty = false
+  } = {}) {
+    if (isHealingInProgress || !ui) return 0;
+    isHealingInProgress = true;
+    let healedCount = 0;
+
+    try {
+      const now = Date.now();
+      let currentSessionChanged = false;
+
+      // 1. Dịch bù các câu trong phiên họp ĐANG DIỄN RA (transcriptList & subtitleItems)
+      const currentList = ui.transcriptList || [];
+      for (const item of currentList) {
+        const srcText = (item.ja || "").trim();
+        if (!srcText || !isUntranslatedValue(item.vi)) continue;
+
+        const cached = utteranceCache.get(item.id);
+        const createdAt = cached?.updatedAtMs || item.updatedAtMs || 0;
+        // Nếu câu đang nói mới xuất hiện < 2.2s và chưa bấm nút ép dịch bù thì chờ luồng chính
+        if (!forceAllEmpty && item.isSpeaking && createdAt > 0 && now - createdAt < 2200) {
+          continue;
+        }
+
+        const fastRes = await sendMessage({
+          type: "TRANSLATE_FAST",
+          text: srcText,
+          sourceLang: settings.sourceLang || "auto",
+          targetLang: settings.targetLang || "vi"
+        });
+
+        if (fastRes?.ok && fastRes.result?.translatedText) {
+          const translated = fastRes.result.translatedText.trim();
+          const romaji = (fastRes.result.romaji || item.romaji || "").trim();
+          const sLang = fastRes.result.sourceLang || item.sourceLang || "ja";
+          const tLang = fastRes.result.targetLang || item.targetLang || "vi";
+
+          item.vi = translated;
+          item.romaji = romaji;
+          item.sourceLang = sLang;
+          item.targetLang = tLang;
+
+          if (cached) {
+            cached.vi = translated;
+            cached.romaji = romaji;
+            cached.sourceLang = sLang;
+            cached.targetLang = tLang;
+          }
+
+          const subItem = (ui.subtitleItems || []).find((x) => x.id === item.id);
+          if (subItem) {
+            subItem.vi = translated;
+            subItem.romaji = romaji;
+            subItem.sourceLang = sLang;
+            subItem.targetLang = tLang;
+          }
+
+          healedCount += 1;
+          currentSessionChanged = true;
+        }
+      }
+
+      // Kiểm tra thêm trong subtitleItems phòng trường hợp có câu chưa vào transcriptList
+      for (const subItem of ui.subtitleItems || []) {
+        const srcText = (subItem.ja || "").trim();
+        if (!srcText || !isUntranslatedValue(subItem.vi)) continue;
+        if (!forceAllEmpty && subItem.isSpeaking && subItem.updatedAtMs && now - subItem.updatedAtMs < 2200) {
+          continue;
+        }
+
+        const fastRes = await sendMessage({
+          type: "TRANSLATE_FAST",
+          text: srcText,
+          sourceLang: settings.sourceLang || "auto",
+          targetLang: settings.targetLang || "vi"
+        });
+
+        if (fastRes?.ok && fastRes.result?.translatedText) {
+          subItem.vi = fastRes.result.translatedText.trim();
+          subItem.romaji = (fastRes.result.romaji || subItem.romaji || "").trim();
+          subItem.sourceLang = fastRes.result.sourceLang || subItem.sourceLang || "ja";
+          subItem.targetLang = fastRes.result.targetLang || subItem.targetLang || "vi";
+          ui.upsertTranscript(subItem);
+          healedCount += 1;
+          currentSessionChanged = true;
+        }
+      }
+
+      if (currentSessionChanged) {
+        ui.renderSubtitles();
+        ui.renderTranscriptList();
+        ui.renderLiveDigestCard();
+        if (ui.isFileModalOpen) {
+          ui.renderLiveFileModalContent();
+        }
+        await persistCurrentSessionNow();
+      }
+
+      // 2. Dịch bù các phiên họp đã lưu trong chrome.storage.local (meetSavedSessions)
+      if (includeAllSavedSessions && Array.isArray(ui.savedSessions)) {
+        for (const sess of ui.savedSessions) {
+          if (!sess || sess.sessionId === currentSessionId || !Array.isArray(sess.transcript)) {
+            continue;
+          }
+          let sessChanged = false;
+          for (const t of sess.transcript) {
+            const srcText = (t.ja || "").trim();
+            if (!srcText || !isUntranslatedValue(t.vi)) continue;
+
+            const fastRes = await sendMessage({
+              type: "TRANSLATE_FAST",
+              text: srcText,
+              sourceLang: settings.sourceLang || "auto",
+              targetLang: settings.targetLang || "vi"
+            });
+
+            if (fastRes?.ok && fastRes.result?.translatedText) {
+              t.vi = fastRes.result.translatedText.trim();
+              t.romaji = (fastRes.result.romaji || t.romaji || "").trim();
+              t.sourceLang = fastRes.result.sourceLang || t.sourceLang || "ja";
+              t.targetLang = fastRes.result.targetLang || t.targetLang || "vi";
+              sessChanged = true;
+              healedCount += 1;
+            }
+          }
+
+          if (sessChanged) {
+            const saveRes = await sendMessage({
+              type: "SAVE_MEETING_SESSION",
+              session: sess
+            });
+            if (saveRes?.ok && saveRes.session) {
+              ui.upsertSavedSessionInList(saveRes.session);
+            }
+          }
+        }
+
+        if (healedCount > 0 && ui.isFileModalOpen) {
+          ui.renderLiveFileModalContent();
+        }
+      }
+    } catch (err) {
+      console.warn("[MeetTranslator] Lỗi khi dịch bù lịch sử:", err);
+    } finally {
+      isHealingInProgress = false;
+    }
+
+    return healedCount;
   }
 
   async function restoreOrLoadHistory() {
@@ -287,6 +466,17 @@
         );
         ui.restoreSessionData(savedCurrent);
       }
+
+      // Tự động kiểm tra và dịch bù ngay các câu bị thiếu bản dịch ("Đang dịch...") trong cuộc họp đang diễn ra & lịch sử
+      setTimeout(async () => {
+        const healed = await healUntranslatedEntries({
+          includeAllSavedSessions: true,
+          forceAllEmpty: true
+        });
+        if (healed > 0) {
+          ui?.showToast(`✅ Đã tự động dịch bù ${healed} câu còn thiếu trong lịch sử cuộc họp!`);
+        }
+      }, 300);
     } catch (err) {
       console.warn("[MeetTranslator] Không thể khôi phục lịch sử phiên họp:", err);
     }
@@ -359,12 +549,16 @@
         sourceLang: settings.sourceLang === "auto" ? "" : settings.sourceLang,
         targetLang: settings.targetLang || "vi",
         time,
+        updatedAtMs: Date.now(),
         isSpeaking,
         provider: "google-free",
         liveCaptionContext: liveCaptionContext || "",
         checkpointJa: "",
         checkpointVi: "",
         checkpointRomaji: "",
+        fastInFlight: false,
+        pendingFastJa: "",
+        lastFastTranslatedJa: "",
         lastFastSeq: 0,
         lastAiSeq: 0
       };
@@ -373,6 +567,7 @@
       entry.speaker = speaker || entry.speaker;
       entry.ja = ja;
       entry.time = time || entry.time;
+      entry.updatedAtMs = Date.now();
       entry.isSpeaking = isSpeaking;
       if (liveCaptionContext) {
         entry.liveCaptionContext = liveCaptionContext;
@@ -382,9 +577,109 @@
   }
 
   /**
+   * Thực thi dịch nhanh (TRANSLATE_FAST) theo cơ chế Single-Flight Queue trên từng câu thoại:
+   * - Không bao giờ vứt bỏ kết quả dịch đang bay về khiến câu bị treo ở "Đang dịch..."
+   * - Nếu trong lúc đang chờ mạng mà người nói nói thêm từ mới, tự động dịch tiếp phần mới ngay khi request trước vừa xong.
+   */
+  async function runFastTranslationQueue(entryId) {
+    const entry = utteranceCache.get(entryId);
+    if (!entry) return;
+
+    if (entry.fastInFlight) {
+      entry.pendingFastJa = entry.ja;
+      return;
+    }
+
+    entry.fastInFlight = true;
+    try {
+      while (true) {
+        const current = utteranceCache.get(entryId);
+        if (!current) break;
+
+        const targetJa = (current.pendingFastJa || current.ja || "").trim();
+        current.pendingFastJa = "";
+
+        if (!targetJa) break;
+        if (current.lastFastTranslatedJa === targetJa && !isUntranslatedValue(current.vi)) {
+          break;
+        }
+
+        const hasValidPrefix =
+          current.checkpointJa &&
+          current.checkpointVi &&
+          targetJa.startsWith(current.checkpointJa);
+
+        const textToTranslate = hasValidPrefix
+          ? targetJa.slice(current.checkpointJa.length).trim()
+          : targetJa;
+
+        if (!textToTranslate) {
+          current.vi = current.checkpointVi;
+          current.romaji = current.checkpointRomaji || current.romaji;
+          current.lastFastTranslatedJa = targetJa;
+          ui.upsertSubtitle(current);
+          ui.upsertTranscript(current);
+          break;
+        }
+
+        const fastRes = await sendMessage({
+          type: "TRANSLATE_FAST",
+          text: textToTranslate,
+          sourceLang: settings.sourceLang || "auto",
+          targetLang: settings.targetLang || "vi"
+        });
+
+        const latest = utteranceCache.get(entryId);
+        if (!latest) break;
+
+        if (fastRes?.ok && fastRes.result) {
+          const fastVi = (fastRes.result.translatedText || "").trim();
+          const fastRm = (fastRes.result.romaji || "").trim();
+          latest.sourceLang = fastRes.result.sourceLang || latest.sourceLang || "ja";
+          latest.targetLang = fastRes.result.targetLang || latest.targetLang || "vi";
+
+          // Chỉ ghi đè nếu câu chưa được AI chốt ở độ dài lớn hơn hoặc bằng
+          const alreadyAiAtSameLen =
+            latest.checkpointJa === latest.ja && String(latest.provider || "").startsWith("ai-");
+
+          if (!alreadyAiAtSameLen || isUntranslatedValue(latest.vi)) {
+            if (hasValidPrefix) {
+              latest.vi = `${latest.checkpointVi} ${fastVi}`.trim();
+              latest.romaji = `${latest.checkpointRomaji} ${fastRm}`.trim();
+            } else {
+              latest.vi = fastVi;
+              latest.romaji = fastRm || latest.romaji;
+            }
+          }
+
+          latest.lastFastTranslatedJa = targetJa;
+          ui.upsertSubtitle(latest);
+          ui.upsertTranscript(latest);
+          schedulePersistSession(false);
+        }
+
+        // Nếu trong lúc chờ mạng mà người nói đã nói thêm chữ mới -> lặp tiếp 1 vòng để cập nhật trọn câu
+        if (latest.pendingFastJa && latest.pendingFastJa !== targetJa) {
+          continue;
+        }
+        if (latest.ja !== targetJa) {
+          latest.pendingFastJa = latest.ja;
+          continue;
+        }
+        break;
+      }
+    } finally {
+      const latest = utteranceCache.get(entryId);
+      if (latest) {
+        latest.fastInFlight = false;
+      }
+    }
+  }
+
+  /**
    * 1) Khi người nói đang nói một câu (Live Caption update):
    *    - Hiển thị ngay câu gốc lên khung phụ đề (0ms delay)
-   *    - Dịch nhanh bằng Google Translate + Chuẩn hóa thuật ngữ IT Infra
+   *    - Dịch nhanh bằng Google Translate Multi-Endpoint + Chuẩn hóa thuật ngữ IT Infra
    */
   async function handleLiveCaption({
     id,
@@ -399,60 +694,11 @@
     ui.upsertSubtitle(entry);
     ui.upsertTranscript(entry);
 
-    if (settings.translationMode === "ai") {
+    if (settings.translationMode === "ai" && settings.apiKey) {
       return;
     }
 
-    entry.lastFastSeq += 1;
-    const currentSeq = entry.lastFastSeq;
-
-    const hasValidPrefix =
-      entry.checkpointJa &&
-      entry.checkpointVi &&
-      ja.startsWith(entry.checkpointJa);
-
-    const textToTranslate = hasValidPrefix
-      ? ja.slice(entry.checkpointJa.length).trim()
-      : ja;
-
-    if (!textToTranslate) {
-      entry.vi = entry.checkpointVi;
-      entry.romaji = entry.checkpointRomaji || entry.romaji;
-      ui.upsertSubtitle(entry);
-      ui.upsertTranscript(entry);
-      return;
-    }
-
-    const fastRes = await sendMessage({
-      type: "TRANSLATE_FAST",
-      text: textToTranslate,
-      sourceLang: settings.sourceLang || "auto",
-      targetLang: settings.targetLang || "vi"
-    });
-
-    const latest = utteranceCache.get(id);
-    if (!latest || latest.lastFastSeq !== currentSeq) {
-      return;
-    }
-
-    if (fastRes?.ok && fastRes.result) {
-      const fastVi = (fastRes.result.translatedText || "").trim();
-      const fastRm = (fastRes.result.romaji || "").trim();
-      latest.sourceLang = fastRes.result.sourceLang || latest.sourceLang || "ja";
-      latest.targetLang = fastRes.result.targetLang || latest.targetLang || "vi";
-
-      if (hasValidPrefix) {
-        latest.vi = `${latest.checkpointVi} ${fastVi}`.trim();
-        latest.romaji = `${latest.checkpointRomaji} ${fastRm}`.trim();
-      } else {
-        latest.vi = fastVi;
-        latest.romaji = fastRm || latest.romaji;
-      }
-
-      ui.upsertSubtitle(latest);
-      ui.upsertTranscript(latest);
-      schedulePersistSession(false);
-    }
+    await runFastTranslationQueue(id);
   }
 
   /**
@@ -509,18 +755,26 @@
     const fullJa = (entry.ja || "").trim();
     if (!fullJa) return;
 
-    if (!entry.vi && settings.translationMode !== "ai") {
+    // Đảm bảo câu luôn có bản dịch nhanh ngay lập tức trước khi gọi AI (hoặc khi không dùng AI)
+    if (
+      (isUntranslatedValue(entry.vi) || entry.lastFastTranslatedJa !== fullJa) &&
+      (settings.translationMode !== "ai" || !settings.apiKey)
+    ) {
       const fastRes = await sendMessage({
         type: "TRANSLATE_FAST",
         text: fullJa,
         sourceLang: settings.sourceLang || "auto",
         targetLang: settings.targetLang || "vi"
       });
-      if (fastRes?.ok && fastRes.result) {
-        entry.vi = fastRes.result.translatedText;
+      if (fastRes?.ok && fastRes.result?.translatedText) {
+        entry.vi = fastRes.result.translatedText.trim();
         entry.romaji = fastRes.result.romaji || entry.romaji;
         entry.sourceLang = fastRes.result.sourceLang || entry.sourceLang || "ja";
         entry.targetLang = fastRes.result.targetLang || entry.targetLang || "vi";
+        entry.lastFastTranslatedJa = fullJa;
+        // Cập nhật giao diện ngay lập tức để không bao giờ bị treo ở "Đang dịch..."
+        ui.upsertSubtitle(entry);
+        ui.upsertTranscript(entry);
       }
     }
 
@@ -535,7 +789,7 @@
       return;
     }
 
-    if (entry.checkpointJa === fullJa && String(entry.provider || "").startsWith("ai-")) {
+    if (entry.checkpointJa === fullJa && String(entry.provider || "").startsWith("ai-") && !isUntranslatedValue(entry.vi)) {
       ui.upsertSubtitle(entry);
       ui.upsertTranscript(entry);
       return;
@@ -555,11 +809,14 @@
     });
 
     const latest = utteranceCache.get(entry.id);
-    if (!latest || latest.lastAiSeq !== currentAiSeq) {
-      return;
-    }
+    if (!latest) return;
 
     if (aiRes?.ok && aiRes.result?.translatedText) {
+      // Nếu đã có một lượt gọi AI mới hơn hoàn tất thì không ghi đè lùi
+      if (latest.lastAiSeq !== currentAiSeq && !isUntranslatedValue(latest.vi)) {
+        return;
+      }
+
       const aiVi = aiRes.result.translatedText.trim();
       const aiRm = (aiRes.result.romaji || "").trim();
 
@@ -586,6 +843,20 @@
 
       latest.note = aiRes.result.note || latest.note || "";
       latest.provider = aiRes.result.provider || `ai-${settings.aiProvider}`;
+    } else if (isUntranslatedValue(latest.vi)) {
+      // Fallback sang TRANSLATE_FAST nếu chế độ "Chỉ AI" gặp lỗi API/Quota để câu không bị kẹt ở "Đang dịch..."
+      const fallbackFast = await sendMessage({
+        type: "TRANSLATE_FAST",
+        text: latest.ja || fullJa,
+        sourceLang: settings.sourceLang || "auto",
+        targetLang: settings.targetLang || "vi"
+      });
+      if (fallbackFast?.ok && fallbackFast.result?.translatedText) {
+        latest.vi = fallbackFast.result.translatedText.trim();
+        latest.romaji = fallbackFast.result.romaji || latest.romaji;
+        latest.sourceLang = fallbackFast.result.sourceLang || latest.sourceLang || "ja";
+        latest.targetLang = fallbackFast.result.targetLang || latest.targetLang || "vi";
+      }
     }
 
     ui.upsertSubtitle(latest);

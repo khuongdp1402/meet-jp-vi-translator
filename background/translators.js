@@ -1,13 +1,15 @@
 // background/translators.js
 // Bộ máy Dịch Đa Ngôn Ngữ (EN ⇄ JA ⇄ VI) Chuyên Sâu Ngành IT Infrastructure & Cloud Migration:
 // - Hỗ trợ tự động nhận diện ngôn ngữ (Tiếng Nhật / Tiếng Anh / Tiếng Việt) hoặc dịch theo cặp tùy chọn.
+// - Cơ chế Đa Cổng Dịch Tự Động Đổi Dự Phòng (6-Endpoint Auto-Failover + Circuit Breaker):
+//   Chống hoàn toàn lỗi HTTP 429 (Rate Limit của client=gtx) gây treo "Đang dịch..." giữa chừng cuộc họp.
 // - Tối ưu hóa sát nghĩa cho ngành IT Infra (Linux/RHEL, Windows Server, Active Directory, Network, Proxy, Firewall, VMware, Cloud KCPS/AWS/Azure, Live Migration, 現調, Parameter Sheet...).
-// - Tự động sửa lỗi nhận diện giọng nói (ASR) trên phụ đề Google Meet và bám sát ngữ cảnh các câu phụ đề liền trước để dịch chính xác.
-// - Tạo Bản Tổng Hợp Trực Tiếp (Live Digest) & AI Summary cho lịch sử các cuộc họp.
 
 const fastCache = new Map();
 const aiCache = new Map();
-const MAX_CACHE_SIZE = 600;
+const inflightFastRequests = new Map();
+const endpointCooldownUntil = new Map();
+const MAX_CACHE_SIZE = 800;
 
 /**
  * Từ điển chuyên ngành IT Infrastructure, Cloud, Network & Vận hành Hệ thống (JA - EN - VI)
@@ -88,10 +90,6 @@ export const DEFAULT_IT_GLOSSARY = [
   { ja: "失礼します", en: "Excuse me / Goodbye", romaji: "shitsurei shimasu", vi: "Tôi xin phép (chào kết thúc họp)" }
 ];
 
-/**
- * Bảng sửa lỗi nhận diện âm thanh (ASR Correction) thường gặp của Google Meet Live Captions
- * đối với các thuật ngữ IT Infrastructure tiếng Nhật và tiếng Anh
- */
 const MEET_ASR_INFRA_CORRECTIONS = [
   { pattern: /幻聴|現況調査/g, replacement: "現調" },
   { pattern: /そつう確認|疎通かくにん/g, replacement: "疎通確認" },
@@ -113,19 +111,19 @@ const MEET_ASR_INFRA_CORRECTIONS = [
   { pattern: /ライブマイグレーション/g, replacement: "ライブマイグレーション (Live Migration)" }
 ];
 
-/**
- * Sửa các bản dịch máy (Google Translate) bị dịch nghĩa đen sai lệch trong ngữ cảnh IT Infra
- */
 const POST_TRANSLATION_INFRA_REFINEMENTS_VI = [
+  { pattern: /^cảm ơn bạn đã làm việc chăm chỉ\.?\s*/i, replacement: "Chào mọi người. " },
+  { pattern: /\bcảm ơn vì sự làm việc chăm chỉ của bạn\b/gi, replacement: "Chào mọi người" },
   { pattern: /\bảo giác thính giác\b/gi, replacement: "khảo sát hiện trạng (現調)" },
   { pattern: /\bđiều tra hiện trường\b/gi, replacement: "khảo sát hiện trạng server (現調)" },
-  { pattern: /\bbằng chứng dấu vết\b|\bdấu vết\b/gi, replacement: "ảnh chụp bằng chứng (証跡)" },
-  { pattern: /\bবàn đạp\b|\bbục giẫm\b/gi, replacement: "máy chủ trung gian (Jump Host)" },
+  { pattern: /\bảnh chụp màn hình của đường dẫn\b/gi, replacement: "ảnh chụp màn hình bằng chứng (証跡)" },
+  { pattern: /\bbằng chứng dấu vết\b|\bdấu vết\b/gi, replacement: "bằng chứng (証跡)" },
+  { pattern: /\bbàn đạp\b|\bbục giẫm\b/gi, replacement: "máy chủ trung gian (Jump Host)" },
   { pattern: /\bgiải quyết tên\b/gi, replacement: "phân giải tên miền (DNS)" },
   { pattern: /\bgiám sát sự sống và cái chết\b|\bgiám sát sống chết\b/gi, replacement: "giám sát trạng thái sống (Health Check)" },
   { pattern: /\bquay lại cắt\b|\bcắt ngược lại\b/gi, replacement: "rollback (khôi phục về ban đầu)" },
-  { pattern: /\bdi cư trực tiếp\b|\bdi trú trực tiếp\b/gi, replacement: "Live Migration" },
-  { pattern: /\btờ tham số\b|\bbảng tham số\b/gi, replacement: "Parameter Sheet (bảng thông số)" },
+  { pattern: /\bdi cư trực tiếp\b|\bdi trú trực tiếp\b|\bdi chuyển trực tiếp\b/gi, replacement: "Live Migration (di trú trực tiếp)" },
+  { pattern: /\btờ tham số\b|\bbảng tham số\b|\bbảng thông số\b/gi, replacement: "Parameter Sheet (bảng thông số)" },
   { pattern: /\btuyến đường tĩnh\b|\blộ trình tĩnh\b/gi, replacement: "Static Route" },
   { pattern: /\bcổng mặc định\b/gi, replacement: "Default Gateway" }
 ];
@@ -138,6 +136,19 @@ function setCache(map, key, value) {
   map.set(key, value);
 }
 
+async function fetchWithTimeout(url, options = {}, timeoutMs = 4200) {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    return await fetch(url, {
+      ...options,
+      signal: controller.signal
+    });
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
 /**
  * Nhận diện nhanh ngôn ngữ của đoạn phụ đề: "ja" (Nhật) | "vi" (Việt) | "en" (Anh)
  */
@@ -145,19 +156,16 @@ export function detectLanguage(text) {
   const clean = (text || "").trim();
   if (!clean) return "ja";
 
-  // 1. Kiểm tra ký tự Hiragana, Katakana, Kanji -> Tiếng Nhật
   if (/[\u3040-\u30ff\u3400-\u4dbf\u4e00-\u9fff]/.test(clean)) {
     return "ja";
   }
 
-  // 2. Kiểm tra dấu thanh & nguyên âm đặc trưng Tiếng Việt
   const viDiacritics =
     /[àáạảãâầấậẩẫăằắặẳẵèéẹẻẽêềếệểễìíịỉĩòóọỏõôồốộổỗơờớợởỡùúụủũưừứựửữỳýỵỷỹđ]/i;
   if (viDiacritics.test(clean)) {
     return "vi";
   }
 
-  // Kiểm tra các từ tiếng Việt phổ biến khi không gõ dấu
   if (
     /\b(cua|nhung|trong|khong|duoc|chung ta|anh|chi|em|viec|nay|phan|kiem tra|xac nhan|he thong)\b/i.test(
       clean
@@ -166,24 +174,27 @@ export function detectLanguage(text) {
     return "vi";
   }
 
-  // 3. Mặc định chữ Latin không dấu -> Tiếng Anh
   return "en";
 }
 
-/**
- * Xác định ngôn ngữ đích hợp lý khi người dùng chọn sourceLang = "auto":
- * - Nếu người nói nói Tiếng Nhật (ja) hoặc Tiếng Anh (en) và targetLang là "vi" -> dịch sang "vi".
- * - Nếu người nói nói trùng với ngôn ngữ đích (VD: người Việt nói "vi" khi targetLang = "vi"),
- *   tự động dịch sang ngôn ngữ phụ (mặc định là "ja" hoặc "en") để câu nói vẫn được dịch hữu ích.
- */
-export function resolveLanguagePair(text, requestedSource = "auto", requestedTarget = "vi", fallbackTarget = "ja") {
+export function resolveLanguagePair(
+  text,
+  requestedSource = "auto",
+  requestedTarget = "vi",
+  fallbackTarget = "ja"
+) {
   const detected = detectLanguage(text);
-  const sourceLang = requestedSource && requestedSource !== "auto" ? requestedSource : detected;
-  let targetLang = requestedTarget || "vi";
+  const validLangs = new Set(["ja", "en", "vi"]);
+  const cleanSrc = typeof requestedSource === "string" ? requestedSource.trim().toLowerCase() : "auto";
+  const cleanTgt = typeof requestedTarget === "string" ? requestedTarget.trim().toLowerCase() : "vi";
+  const cleanFb = typeof fallbackTarget === "string" ? fallbackTarget.trim().toLowerCase() : "ja";
+
+  const sourceLang = validLangs.has(cleanSrc) ? cleanSrc : detected;
+  let targetLang = validLangs.has(cleanTgt) ? cleanTgt : "vi";
 
   if (sourceLang === targetLang) {
     if (sourceLang === "vi") {
-      targetLang = fallbackTarget && fallbackTarget !== "vi" ? fallbackTarget : "ja";
+      targetLang = validLangs.has(cleanFb) && cleanFb !== "vi" ? cleanFb : "ja";
     } else if (sourceLang === "ja") {
       targetLang = "vi";
     } else if (sourceLang === "en") {
@@ -194,9 +205,6 @@ export function resolveLanguagePair(text, requestedSource = "auto", requestedTar
   return { sourceLang, targetLang, detectedLang: detected };
 }
 
-/**
- * Chuẩn hóa văn bản phụ đề Google Meet trước khi dịch (khắc phục lỗi ASR cho từ vựng IT Infra)
- */
 export function normalizeMeetCaptionForITInfra(text) {
   let out = (text || "").trim();
   if (!out) return "";
@@ -206,9 +214,6 @@ export function normalizeMeetCaptionForITInfra(text) {
   return out;
 }
 
-/**
- * Hậu xử lý bản dịch tiếng Việt để đảm bảo thuật ngữ IT Infra chuẩn xác
- */
 function refineTranslatedInfraVi(viText) {
   let out = (viText || "").trim();
   if (!out) return "";
@@ -218,9 +223,35 @@ function refineTranslatedInfraVi(viText) {
   return out;
 }
 
+function parseSingleEndpointData(data, pair) {
+  let translatedText = "";
+  let romaji = "";
+  const apiDetectedLang = (typeof data?.[2] === "string" && data[2]) || pair.sourceLang;
+
+  if (Array.isArray(data) && Array.isArray(data[0])) {
+    for (const segment of data[0]) {
+      if (!Array.isArray(segment)) continue;
+      if (typeof segment[0] === "string") {
+        translatedText += segment[0];
+      }
+      if (pair.sourceLang === "ja" && typeof segment[3] === "string" && segment[3].trim()) {
+        romaji += (romaji ? " " : "") + segment[3].trim();
+      } else if (pair.targetLang === "ja" && typeof segment[2] === "string" && segment[2].trim()) {
+        romaji += (romaji ? " " : "") + segment[2].trim();
+      }
+    }
+  }
+
+  return {
+    translatedText: translatedText.trim(),
+    romaji: romaji.trim(),
+    detectedLang: apiDetectedLang
+  };
+}
+
 /**
- * Tầng 1: Dịch siêu tốc miễn phí bằng Google Translate endpoint (không cần API key)
- * Hỗ trợ EN ⇄ JA ⇄ VI + chuẩn hóa thuật ngữ IT Infra + ngữ cảnh phụ đề liền trước
+ * Tầng 1: Dịch siêu tốc miễn phí với 6 Cổng Dự Phòng Tự Động (Multi-Endpoint Auto-Failover)
+ * Khi client=gtx bị Google chặn tạm thời (HTTP 429), tự động chuyển tức thì sang dict-chrome-ex, client=at, clients5, translate.google.com và MyMemory!
  */
 export async function translateFastGoogle(
   text,
@@ -252,62 +283,148 @@ export async function translateFastGoogle(
     return fastCache.get(cacheKey);
   }
 
-  const url =
-    `https://translate.googleapis.com/translate_a/single?client=gtx` +
-    `&sl=${encodeURIComponent(pair.sourceLang)}` +
-    `&tl=${encodeURIComponent(pair.targetLang)}` +
-    `&dt=t&dt=rm&q=${encodeURIComponent(normalizedText)}`;
-
-  const response = await fetch(url, {
-    method: "GET",
-    headers: {
-      Accept: "application/json"
-    }
-  });
-
-  if (!response.ok) {
-    throw new Error(`Google Translate HTTP ${response.status}`);
+  if (inflightFastRequests.has(cacheKey)) {
+    return inflightFastRequests.get(cacheKey);
   }
 
-  const data = await response.json();
-  let translatedText = "";
-  let romaji = "";
-  const apiDetectedLang = (typeof data?.[2] === "string" && data[2]) || pair.sourceLang;
+  const taskPromise = (async () => {
+    const sl = encodeURIComponent(pair.sourceLang);
+    const tl = encodeURIComponent(pair.targetLang);
+    const q = encodeURIComponent(normalizedText);
 
-  if (Array.isArray(data) && Array.isArray(data[0])) {
-    for (const segment of data[0]) {
-      if (!Array.isArray(segment)) continue;
-      if (typeof segment[0] === "string") {
-        translatedText += segment[0];
+    const endpoints = [
+      {
+        id: "googleapis-dict-chrome-ex",
+        type: "single",
+        url: `https://translate.googleapis.com/translate_a/single?client=dict-chrome-ex&sl=${sl}&tl=${tl}&dt=t&dt=rm&q=${q}`
+      },
+      {
+        id: "googleapis-at",
+        type: "single",
+        url: `https://translate.googleapis.com/translate_a/single?client=at&sl=${sl}&tl=${tl}&dt=t&dt=rm&q=${q}`
+      },
+      {
+        id: "google-com-dict-chrome-ex",
+        type: "single",
+        url: `https://translate.google.com/translate_a/single?client=dict-chrome-ex&sl=${sl}&tl=${tl}&dt=t&dt=rm&q=${q}`
+      },
+      {
+        id: "clients5-dict",
+        type: "clients5",
+        url: `https://clients5.google.com/translate_a/t?client=dict-chrome-ex&sl=${sl}&tl=${tl}&q=${q}`
+      },
+      {
+        id: "googleapis-gtx",
+        type: "single",
+        url: `https://translate.googleapis.com/translate_a/single?client=gtx&sl=${sl}&tl=${tl}&dt=t&dt=rm&q=${q}`
+      },
+      {
+        id: "mymemory",
+        type: "mymemory",
+        url: `https://api.mymemory.translated.net/get?q=${q}&langpair=${sl}|${tl}`
       }
-      if (pair.sourceLang === "ja" && typeof segment[3] === "string" && segment[3].trim()) {
-        romaji += (romaji ? " " : "") + segment[3].trim();
-      } else if (pair.targetLang === "ja" && typeof segment[2] === "string" && segment[2].trim()) {
-        romaji += (romaji ? " " : "") + segment[2].trim();
+    ];
+
+    const now = Date.now();
+    // Ưu tiên các endpoint không nằm trong thời gian cooldown (429), nếu tất cả đều cooldown thì vẫn thử lại từ đầu
+    const activeEndpoints = endpoints.filter(
+      (ep) => (endpointCooldownUntil.get(ep.id) || 0) <= now
+    );
+    const orderedEndpoints = activeEndpoints.length > 0 ? activeEndpoints : endpoints;
+
+    for (const ep of orderedEndpoints) {
+      try {
+        const response = await fetchWithTimeout(
+          ep.url,
+          {
+            method: "GET",
+            headers: { Accept: "application/json" }
+          },
+          4000
+        );
+
+        if (!response.ok) {
+          if (response.status === 429 || response.status === 403 || response.status === 503) {
+            // Tạm ngưng cổng bị chặn 429 trong 4 phút để các câu tiếp theo không bị chậm
+            endpointCooldownUntil.set(ep.id, Date.now() + 4 * 60 * 1000);
+          }
+          continue;
+        }
+
+        const rawBody = await response.text();
+        if (!rawBody || rawBody.trim().startsWith("<")) {
+          // Trường hợp trả về trang HTML Captcha của Google
+          endpointCooldownUntil.set(ep.id, Date.now() + 4 * 60 * 1000);
+          continue;
+        }
+
+        const data = JSON.parse(rawBody);
+        let translatedText = "";
+        let romaji = "";
+        let detectedLang = pair.sourceLang;
+
+        if (ep.type === "single") {
+          const parsed = parseSingleEndpointData(data, pair);
+          translatedText = parsed.translatedText;
+          romaji = parsed.romaji;
+          detectedLang = parsed.detectedLang;
+        } else if (ep.type === "clients5") {
+          if (Array.isArray(data)) {
+            if (Array.isArray(data[0])) {
+              translatedText = String(data[0][0] || "").trim();
+              detectedLang = String(data[0][1] || pair.sourceLang);
+            } else if (typeof data[0] === "string") {
+              translatedText = data[0].trim();
+            }
+          }
+        } else if (ep.type === "mymemory") {
+          translatedText = String(data?.responseData?.translatedText || "").trim();
+        }
+
+        if (translatedText) {
+          if (pair.targetLang === "vi") {
+            translatedText = refineTranslatedInfraVi(translatedText);
+          }
+          const result = {
+            translatedText,
+            romaji,
+            sourceLang: detectedLang,
+            targetLang: pair.targetLang,
+            provider: "google-free"
+          };
+          setCache(fastCache, cacheKey, result);
+          return result;
+        }
+      } catch (err) {
+        // Tự động chuyển sang cổng tiếp theo trong danh sách
+        continue;
       }
     }
+
+    // Fallback cuối cùng bằng từ điển IT Infra nội bộ nếu mất mạng hoàn toàn
+    let fallbackText = normalizedText;
+    for (const item of DEFAULT_IT_GLOSSARY) {
+      if (item.ja && fallbackText.includes(item.ja)) {
+        fallbackText = fallbackText.split(item.ja).join(`${item.vi} (${item.ja})`);
+      }
+    }
+    return {
+      translatedText: fallbackText,
+      romaji: "",
+      sourceLang: pair.sourceLang,
+      targetLang: pair.targetLang,
+      provider: "offline-glossary"
+    };
+  })();
+
+  inflightFastRequests.set(cacheKey, taskPromise);
+  try {
+    return await taskPromise;
+  } finally {
+    inflightFastRequests.delete(cacheKey);
   }
-
-  let finalTranslated = translatedText.trim();
-  if (pair.targetLang === "vi") {
-    finalTranslated = refineTranslatedInfraVi(finalTranslated);
-  }
-
-  const result = {
-    translatedText: finalTranslated,
-    romaji: romaji.trim(),
-    sourceLang: apiDetectedLang,
-    targetLang: pair.targetLang,
-    provider: "google-free"
-  };
-
-  setCache(fastCache, cacheKey, result);
-  return result;
 }
 
-/**
- * Xây dựng danh sách từ điển IT Infra để nhúng vào prompt AI
- */
 function buildGlossaryText(customGlossary = []) {
   const combined = [...DEFAULT_IT_GLOSSARY, ...(Array.isArray(customGlossary) ? customGlossary : [])];
   return combined
@@ -327,8 +444,6 @@ const LANG_NAMES = {
 
 /**
  * Tầng 2: Dịch chuẩn ngữ cảnh ngành IT Infrastructure & Cloud Migration bằng AI (Gemini / Groq / OpenAI).
- * Dựa trực tiếp vào đoạn phụ đề đang hiển thị trên Google Meet (liveCaptionContext) và các câu liền trước (recentContext)
- * để dịch sát nghĩa, tự động khôi phục chủ ngữ bị lược bỏ và sửa lỗi nhận diện âm thanh của Meet.
  */
 export async function translateWithAI({
   text,
@@ -430,10 +545,6 @@ ${glossaryText}
   return result;
 }
 
-/**
- * Hỗ trợ trả lời nhanh đa ngôn ngữ (Quick Reply):
- * Người dùng gõ ý bằng Tiếng Việt (hoặc Tiếng Anh) -> tạo câu trả lời chuẩn IT Infra bằng Tiếng Nhật (JA) hoặc Tiếng Anh (EN)
- */
 export async function generateQuickReply({
   vietnameseText,
   targetReplyLang = "ja",
@@ -548,10 +659,6 @@ Trả về đúng định dạng JSON hợp lệ:
   };
 }
 
-/**
- * Phân tích tự động & tức thì (0ms) nội dung cuộc họp đang trao đổi những gì (Live Meeting Digest)
- * Phục vụ hiển thị trong Danh sách Lịch sử Cuộc họp và Thẻ Tóm tắt Nhanh ngay cả khi chưa gọi AI.
- */
 export function buildLiveMeetingDigest(transcript = []) {
   if (!Array.isArray(transcript) || transcript.length === 0) {
     return {
@@ -607,7 +714,6 @@ export function buildLiveMeetingDigest(transcript = []) {
     (d) => d.name
   );
 
-  // Trích xuất các thực thể kỹ thuật (IP, file path, command, server name, sheet column)
   const techMatches = new Set();
   const entityRegex =
     /(\b\d{1,3}(?:\.\d{1,3}){3}(?:\/\d{1,2})?\b|\/etc\/[a-z0-9._/-]+|\/mnt\/[a-z0-9._/-]+|\/var\/[a-z0-9._/-]+|\b(?:RHEL|CentOS|Ubuntu|Windows Server)\s*\d*(?:\.\d+)?\b|\b(?:systemctl|nmcli|hostnamectl|timedatectl|getenforce|swapon|chronyc|df -h|lsblk|ip route|i-FILTER|SELinux|firewalld|KCPS\d?|FortiGate|Active Directory)\b|\bcột\s+[A-Z]{1,2}\d*\b|\bQA\b)/gi;
@@ -619,7 +725,6 @@ export function buildLiveMeetingDigest(transcript = []) {
     }
   }
 
-  // Lọc các câu liên quan đến quyết định / công việc cần làm
   const actionPattern =
     /(確認|対応|納期|明日|今日|来週|今週|まで|お願い|修正|課題|残し|追加|xác nhận|kiểm tra|xử lý|deadline|hạn|ngày mai|hôm nay|tuần sau|nhờ|cần làm|sẽ làm|giữ nguyên|bổ sung|please|need to|will check|action item|todo)/i;
   const actionItems = transcript
@@ -656,9 +761,6 @@ export function buildLiveMeetingDigest(transcript = []) {
   };
 }
 
-/**
- * Định dạng lịch sử hội thoại để đưa vào Prompt AI
- */
 function formatTranscriptForLLM(transcript = [], maxItems = 200) {
   return transcript
     .slice(-maxItems)
@@ -672,9 +774,6 @@ function formatTranscriptForLLM(transcript = [], maxItems = 200) {
     .join("\n\n");
 }
 
-/**
- * Tạo bản tổng hợp thông minh ngay cả khi chưa nhập API Key (Chế độ Offline Smart IT Infra)
- */
 export function buildSmartOfflineSummary(transcript = [], customPrompt = "", attachedFile = null) {
   const digest = buildLiveMeetingDigest(transcript);
   const firstTime = transcript[0]?.time || "--:--";
@@ -766,7 +865,7 @@ export function buildSmartOfflineSummary(transcript = [], customPrompt = "", att
     const recentSp = items.slice(-5);
     lines.push(`### 🗣️ ${sp} (${items.length} câu phát biểu)`);
     recentSp.forEach((t) => {
-      lines.push(`- **[${t.time}]** ${t.vi || "(Đang dịch...)"}`);
+      lines.push(`- **[${t.time}]** ${t.vi || t.ja}`);
       lines.push(`  *Gốc: ${t.ja}*`);
     });
     lines.push("");
@@ -794,9 +893,6 @@ export function buildSmartOfflineSummary(transcript = [], customPrompt = "", att
   return lines.join("\n");
 }
 
-/**
- * Tóm tắt biên bản cuộc họp (Meeting Summary) chuyên sâu ngành IT Infra
- */
 export async function summarizeMeetingTranscript({
   transcript = [],
   attachedFile = null,
@@ -814,12 +910,13 @@ export async function summarizeMeetingTranscript({
     return buildSmartOfflineSummary(transcript, customInstruction, attachedFile);
   }
 
-  const formattedTranscript = formatTranscriptForLLM(transcript, 180);
-  const fileContext = attachedFile?.content
-    ? `\n\n[TÀI LIỆU ĐÍNH KÈM TRONG CUỘC HỌP: ${attachedFile.name}]\n${String(attachedFile.content).slice(0, 12000)}\n`
-    : "";
+  try {
+    const formattedTranscript = formatTranscriptForLLM(transcript, 180);
+    const fileContext = attachedFile?.content
+      ? `\n\n[TÀI LIỆU ĐÍNH KÈM TRONG CUỘC HỌP: ${attachedFile.name}]\n${String(attachedFile.content).slice(0, 12000)}\n`
+      : "";
 
-  const systemPrompt = `Bạn là Kỹ sư trưởng Hạ tầng (Lead Infrastructure BrSE) kiêm Thư ký cuộc họp đa ngôn ngữ (Anh - Nhật - Việt).
+    const systemPrompt = `Bạn là Kỹ sư trưởng Hạ tầng (Lead Infrastructure BrSE) kiêm Thư ký cuộc họp đa ngôn ngữ (Anh - Nhật - Việt).
 Dựa trên toàn bộ lịch sử hội thoại trong cuộc họp Google Meet dưới đây (và tài liệu đính kèm nếu có), hãy lập BẢN TỔNG HỢP CUỘC HỌP CHI TIẾT (Markdown) giúp người đọc nắm bắt ngay cuộc họp đang trao đổi những gì:
 
 1. 📌 **Cuộc họp đang trao đổi về nội dung gì? (Executive Summary)**: Mục tiêu chính, dự án/hệ thống/server nào đang được khảo sát hoặc thảo luận.
@@ -827,23 +924,22 @@ Dựa trên toàn bộ lịch sử hội thoại trong cuộc họp Google Meet 
 3. 👤 **Ý chính theo từng người tham gia (Speaker Breakdown)**: Mỗi người đã trình bày, giải thích hoặc yêu cầu những gì.
 4. ✅ **Các quyết định & Thống nhất đã chốt (Decisions Made)**.
 5. 🚀 **Action Items & Việc cần làm tiếp theo**: Ai làm gì, cần xác nhận (QA) điểm nào, deadline khi nào.${
-    customInstruction ? `\n6. 🎯 **Yêu cầu bổ sung từ người dùng**: ${customInstruction}` : ""
-  }`;
+      customInstruction ? `\n6. 🎯 **Yêu cầu bổ sung từ người dùng**: ${customInstruction}` : ""
+    }`;
 
-  const rawText = await callLLMText({
-    provider,
-    apiKey,
-    model: settings.aiModel,
-    systemPrompt,
-    userPrompt: `Lịch sử hội thoại cuộc họp (${transcript.length} câu thoại):\n${formattedTranscript}${fileContext}`
-  });
-
-  return rawText;
+    return await callLLMText({
+      provider,
+      apiKey,
+      model: settings.aiModel,
+      systemPrompt,
+      userPrompt: `Lịch sử hội thoại cuộc họp (${transcript.length} câu thoại):\n${formattedTranscript}${fileContext}`
+    });
+  } catch (err) {
+    console.warn("[MeetTranslator] AI Summary lỗi, dùng Smart Offline Summary:", err);
+    return buildSmartOfflineSummary(transcript, customInstruction, attachedFile);
+  }
 }
 
-/**
- * Chat tương tác với AI để hỏi đáp hoặc yêu cầu Summary tùy chỉnh về cuộc họp
- */
 export async function chatWithMeetingTranscript({
   prompt,
   transcript = [],
@@ -870,47 +966,51 @@ export async function chatWithMeetingTranscript({
     };
   }
 
-  const formattedTranscript = formatTranscriptForLLM(transcript, 180);
-  const fileContext = attachedFile?.content
-    ? `\n\n=== TÀI LIỆU FILE ĐÍNH KÈM (${attachedFile.name}) ===\n${String(attachedFile.content).slice(0, 12000)}\n`
-    : "";
+  try {
+    const formattedTranscript = formatTranscriptForLLM(transcript, 180);
+    const fileContext = attachedFile?.content
+      ? `\n\n=== TÀI LIỆU FILE ĐÍNH KÈM (${attachedFile.name}) ===\n${String(attachedFile.content).slice(0, 12000)}\n`
+      : "";
 
-  const historyText = chatHistory
-    .slice(-6)
-    .map((m) => `${m.role === "user" ? "Người dùng" : "Trợ lý AI"}: ${m.content}`)
-    .join("\n\n");
+    const historyText = chatHistory
+      .slice(-6)
+      .map((m) => `${m.role === "user" ? "Người dùng" : "Trợ lý AI"}: ${m.content}`)
+      .join("\n\n");
 
-  const systemPrompt = `Bạn là Trợ lý AI Phân tích & Tổng hợp Cuộc họp IT Infrastructure trực tiếp trên Google Meet (Hỗ trợ Tiếng Anh, Tiếng Nhật, Tiếng Việt).
+    const systemPrompt = `Bạn là Trợ lý AI Phân tích & Tổng hợp Cuộc họp IT Infrastructure trực tiếp trên Google Meet (Hỗ trợ Tiếng Anh, Tiếng Nhật, Tiếng Việt).
 Người dùng đang xem lại hoặc đang ở trong cuộc họp và hỏi bạn về nội dung cuộc họp.
 Quy tắc:
 - Trả lời chính xác, sát ngữ cảnh kỹ thuật IT Infra (Server, Linux/RHEL, Windows, AD, Network, Proxy, Firewall, Cloud Migration, Parameter Sheet...) dựa trên dữ liệu Lịch sử cuộc họp.
 - Trình bày bằng Markdown rõ ràng, có tiêu đề, gạch đầu dòng, in đậm các thông số kỹ thuật, tên người nói và mốc thời gian.
 - Nếu người dùng yêu cầu viết biên bản Gijiroku tiếng Nhật hoặc tiếng Anh, hãy trình bày song ngữ chuyên nghiệp.`;
 
-  const userPrompt = `=== DỮ LIỆU HỘI THOẠI CUỘC HỌP (${transcript.length} câu thoại) ===
+    const userPrompt = `=== DỮ LIỆU HỘI THOẠI CUỘC HỌP (${transcript.length} câu thoại) ===
 ${formattedTranscript || "(Chưa có câu thoại nào)"}
 ${fileContext}
 ${historyText ? `\n=== LỊCH SỬ CHAT TRƯỚC ĐÓ ===\n${historyText}\n` : ""}
 === YÊU CẦU HIỆN TẠI CỦA NGƯỜI DÙNG ===
 ${cleanPrompt}`;
 
-  const rawText = await callLLMText({
-    provider,
-    apiKey,
-    model: settings.aiModel,
-    systemPrompt,
-    userPrompt
-  });
+    const rawText = await callLLMText({
+      provider,
+      apiKey,
+      model: settings.aiModel,
+      systemPrompt,
+      userPrompt
+    });
 
-  return {
-    answer: (rawText || "").trim(),
-    provider: `ai-${provider}`
-  };
+    return {
+      answer: (rawText || "").trim(),
+      provider: `ai-${provider}`
+    };
+  } catch (err) {
+    return {
+      answer: buildSmartOfflineSummary(transcript, cleanPrompt, attachedFile),
+      provider: "offline-smart-fallback"
+    };
+  }
 }
 
-/**
- * Chế độ 2: Nhận diện giọng nói từ chunk âm thanh (Audio Capture) hỗ trợ EN / JA / VI
- */
 export async function transcribeAndTranslateAudioChunk({
   base64Audio,
   mimeType = "audio/webm",
@@ -940,29 +1040,33 @@ Nếu có lời nói, hãy ghi lại chính xác câu gốc vào "ja", ghi mã n
     } vào "vi", ghi phiên âm vào "romaji" (nếu là tiếng Nhật), và nếu nhận thấy giọng người nói khác với câu trước thì đặt "speakerChanged": true.
 CHỈ trả về JSON hợp lệ: {"ja": "...", "vi": "...", "romaji": "...", "sourceLang": "ja", "speakerChanged": false}`;
 
-    const response = await fetch(url, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        contents: [
-          {
-            parts: [
-              { text: prompt },
-              {
-                inlineData: {
-                  mimeType: mimeType.split(";")[0] || "audio/webm",
-                  data: base64Audio
+    const response = await fetchWithTimeout(
+      url,
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          contents: [
+            {
+              parts: [
+                { text: prompt },
+                {
+                  inlineData: {
+                    mimeType: mimeType.split(";")[0] || "audio/webm",
+                    data: base64Audio
+                  }
                 }
-              }
-            ]
+              ]
+            }
+          ],
+          generationConfig: {
+            temperature: 0.1,
+            responseMimeType: "application/json"
           }
-        ],
-        generationConfig: {
-          temperature: 0.1,
-          responseMimeType: "application/json"
-        }
-      })
-    });
+        })
+      },
+      12000
+    );
 
     if (!response.ok) {
       const errText = await response.text();
@@ -983,7 +1087,6 @@ CHỈ trả về JSON hợp lệ: {"ja": "...", "vi": "...", "romaji": "...", "s
     };
   }
 
-  // Groq hoặc OpenAI Whisper API
   const whisperUrl =
     provider === "groq"
       ? "https://api.groq.com/openai/v1/audio/transcriptions"
@@ -1005,13 +1108,17 @@ CHỈ trả về JSON hợp lệ: {"ja": "...", "vi": "...", "romaji": "...", "s
   }
   formData.append("response_format", "json");
 
-  const sttRes = await fetch(whisperUrl, {
-    method: "POST",
-    headers: {
-      Authorization: `Bearer ${apiKey}`
+  const sttRes = await fetchWithTimeout(
+    whisperUrl,
+    {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${apiKey}`
+      },
+      body: formData
     },
-    body: formData
-  });
+    12000
+  );
 
   if (!sttRes.ok) {
     const errText = await sttRes.text();
@@ -1057,9 +1164,6 @@ CHỈ trả về JSON hợp lệ: {"ja": "...", "vi": "...", "romaji": "...", "s
   };
 }
 
-/**
- * Helper gọi LLM trả về JSON
- */
 async function callLLMJson({ provider, apiKey, model, systemPrompt, userPrompt }) {
   const rawText = await callLLMText({
     provider,
@@ -1093,22 +1197,26 @@ async function callLLMText({
       generationConfig.responseMimeType = "application/json";
     }
 
-    const response = await fetch(url, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        systemInstruction: {
-          parts: [{ text: systemPrompt }]
-        },
-        contents: [
-          {
-            role: "user",
-            parts: [{ text: userPrompt }]
-          }
-        ],
-        generationConfig
-      })
-    });
+    const response = await fetchWithTimeout(
+      url,
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          systemInstruction: {
+            parts: [{ text: systemPrompt }]
+          },
+          contents: [
+            {
+              role: "user",
+              parts: [{ text: userPrompt }]
+            }
+          ],
+          generationConfig
+        })
+      },
+      12000
+    );
 
     if (!response.ok) {
       const errText = await response.text();
@@ -1138,14 +1246,18 @@ async function callLLMText({
     payload.response_format = { type: "json_object" };
   }
 
-  const response = await fetch(endpoint, {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      Authorization: `Bearer ${apiKey}`
+  const response = await fetchWithTimeout(
+    endpoint,
+    {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: `Bearer ${apiKey}`
+      },
+      body: JSON.stringify(payload)
     },
-    body: JSON.stringify(payload)
-  });
+    12000
+  );
 
   if (!response.ok) {
     const errText = await response.text();
