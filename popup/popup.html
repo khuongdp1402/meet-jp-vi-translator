@@ -1,0 +1,153 @@
+<!DOCTYPE html>
+<html lang="vi">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Meet EN-JA-VI IT Infra Translator</title>
+  <link rel="stylesheet" href="popup.css" />
+</head>
+<body>
+  <div class="popup-container">
+    <header class="popup-header">
+      <div class="logo-row">
+        <span class="badge">EN•JA•VI</span>
+        <div>
+          <h1>Meet IT Infra Translator</h1>
+          <p>Dịch tự ngắt nghĩa Anh - Nhật - Việt & Lưu lịch sử họp</p>
+        </div>
+      </div>
+      <div class="popup-tabs">
+        <button class="popup-tab active" data-tab="history">📚 Lịch sử & Tổng hợp (<span id="sessionCount">0</span>)</button>
+        <button class="popup-tab" data-tab="settings">⚙️ Cấu hình Dịch</button>
+      </div>
+    </header>
+
+    <!-- TAB 1: DANH SÁCH LỊCH SỬ & NỘI DUNG TỔNG HỢP CUỘC HỌP -->
+    <div id="tab-history" class="tab-view active">
+      <div id="historyListView">
+        <div class="history-toolbar">
+          <span class="field-label">Danh sách cuộc họp đã lưu tự động:</span>
+          <button id="btnClearAllHistory" class="btn-mini-danger" title="Xóa toàn bộ lịch sử">🗑️ Xóa hết</button>
+        </div>
+        <div id="sessionList" class="session-list"></div>
+      </div>
+
+      <!-- Khung xem chi tiết 1 cuộc họp ngay trong Popup -->
+      <div id="sessionDetailView" style="display:none;">
+        <div class="detail-header">
+          <button id="btnBackToList" class="btn-mini">⬅️ Quay lại danh sách</button>
+          <div style="display:flex; gap:5px;">
+            <button id="btnDetailCopy" class="btn-mini">📋 Copy</button>
+            <button id="btnDetailDownloadMd" class="btn-mini primary">📥 Tải .MD</button>
+          </div>
+        </div>
+        <div id="detailTitle" class="detail-title"></div>
+        <div id="detailMeta" class="detail-meta"></div>
+        <div id="detailContent" class="detail-content"></div>
+      </div>
+    </div>
+
+    <!-- TAB 2: CẤU HÌNH ĐA NGÔN NGỮ & AI IT INFRA -->
+    <div id="tab-settings" class="tab-view">
+      <section class="card">
+        <div class="card-title">🌐 Ngôn ngữ & Tự động ngắt nghĩa (IT Infra)</div>
+        <div class="row-2col">
+          <div>
+            <label class="field-label" for="sourceLang">Ngôn ngữ thu (Source):</label>
+            <select id="sourceLang" class="input-control">
+              <option value="auto">🌐 Tự động (EN/JA/VI)</option>
+              <option value="ja">🇯🇵 Tiếng Nhật (JA)</option>
+              <option value="en">🇬🇧 Tiếng Anh (EN)</option>
+              <option value="vi">🇻🇳 Tiếng Việt (VI)</option>
+            </select>
+          </div>
+          <div>
+            <label class="field-label" for="targetLang">Dịch sang (Target):</label>
+            <select id="targetLang" class="input-control">
+              <option value="vi">🇻🇳 Tiếng Việt (VI)</option>
+              <option value="ja">🇯🇵 Tiếng Nhật (JA)</option>
+              <option value="en">🇬🇧 Tiếng Anh (EN)</option>
+            </select>
+          </div>
+        </div>
+        <label class="checkbox-label" style="margin-top:4px;">
+          <input id="smartBreakEnabled" type="checkbox" checked />
+          🧠 Tự động ngắt câu thông minh theo ý nghĩa & nhịp nghỉ (không đợi người khác chen vào)
+        </label>
+      </section>
+
+      <section class="card">
+        <div class="card-title">🎙️ Cơ chế thu nhận trên Google Meet</div>
+        <div class="mode-switch">
+          <button class="mode-btn active" id="modeCaptions" data-mode="captions">
+            <strong>📝 Bắt CC Meet</strong>
+            <span>Bám sát phụ đề Meet, có tên người nói</span>
+          </button>
+          <button class="mode-btn" id="modeAudio" data-mode="audio">
+            <strong>🔊 Thu Audio Tab</strong>
+            <span>Không cần bật CC, dùng AI</span>
+          </button>
+        </div>
+        <div id="audioControlRow" class="audio-control-row" style="display:none;">
+          <button id="btnToggleTabAudio" class="btn-danger">🔴 Bắt đầu thu Audio Tab hiện tại</button>
+        </div>
+      </section>
+
+      <section class="card">
+        <div class="card-title">⚡ Bộ máy dịch chuyên ngành IT Infra</div>
+        <label class="field-label" for="translationMode">Chế độ dịch:</label>
+        <select id="translationMode" class="input-control">
+          <option value="dual">Kép: Google Translate (Tức thì) + AI (Chuẩn IT Infra)</option>
+          <option value="google">Chỉ Google Translate + Từ điển IT Infra (Miễn phí)</option>
+          <option value="ai">Chỉ dùng AI (Cần API Key)</option>
+        </select>
+
+        <div class="row-2col">
+          <div>
+            <label class="field-label" for="aiProvider">AI Provider:</label>
+            <select id="aiProvider" class="input-control">
+              <option value="gemini">Google Gemini</option>
+              <option value="groq">Groq (Llama 3.3 / Whisper)</option>
+              <option value="openai">OpenAI</option>
+            </select>
+          </div>
+          <div>
+            <label class="field-label" for="aiModel">Model:</label>
+            <input id="aiModel" type="text" class="input-control" placeholder="gemini-2.5-flash" />
+          </div>
+        </div>
+
+        <label class="field-label" for="apiKey">API Key (Tùy chọn cho chế độ Kép):</label>
+        <input
+          id="apiKey"
+          type="password"
+          class="input-control"
+          placeholder="Dán API Key (VD: AIzaSy... từ Google AI Studio)"
+        />
+      </section>
+
+      <section class="card">
+        <div class="card-title">🎨 Hiển thị phụ đề</div>
+        <div class="row-2col">
+          <div>
+            <label class="field-label" for="fontSize">Cỡ chữ (px):</label>
+            <input id="fontSize" type="number" min="13" max="32" value="18" class="input-control" />
+          </div>
+          <div class="checkbox-col">
+            <label class="checkbox-label">
+              <input id="showRomajiOnSubtitles" type="checkbox" checked />
+              Hiện phiên âm Romaji
+            </label>
+          </div>
+        </div>
+      </section>
+
+      <footer class="popup-footer">
+        <button id="btnSave" class="btn-primary">💾 Lưu cài đặt</button>
+        <div id="statusMsg" class="status-msg"></div>
+      </footer>
+    </div>
+  </div>
+  <script src="popup.js" type="module"></script>
+</body>
+</html>

@@ -1,0 +1,18 @@
+# OS & Editor files
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Environment & Secrets
+.env
+.env.*
+*.key
+*.pem
+
+# Node / Build artifacts (if any)
+node_modules/
+dist/
+*.zip
